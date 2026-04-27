@@ -21,7 +21,7 @@ const createBookingSchema = z.object({
   date:            dateField,
   time:            timeField,
   address:         z.string({ required_error: 'address is required' }).min(5, 'address must be at least 5 characters'),
-  price:           z.number({ required_error: 'price is required' }).min(0, 'price cannot be negative'),
+  price:           z.number({ required_error: 'price is required' }).positive('price must be greater than 0'),
   paymentMethod:   z.string({ required_error: 'paymentMethod is required' }).min(1, 'paymentMethod is required'),
   serviceName:     z.string().min(1).optional(),
   serviceCategory: z.string().min(1).optional(),
