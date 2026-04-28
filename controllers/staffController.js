@@ -273,6 +273,39 @@ const getMyPerformance = async (req, res) => {
 
 // ─── GET /api/staff/reassignments  (admin only) ──────────────────────────────
 // Returns declined tasks and reassignment info for the admin panel
+
+// For team bookings the replacement is the member whose ObjectId timestamp
+// (first 4 bytes) falls after the decline — that is when they were added.
+// For single-staff bookings assignedStaffId/Name/Email already holds the
+// replacement directly.
+const findReplacement = (booking, decline) => {
+  const isTeam = booking.assignedTeam && booking.assignedTeam.length > 0;
+  if (!isTeam) {
+    return { staffEmail: booking.assignedStaffEmail || '', staffName: booking.assignedStaffName || '' };
+  }
+
+  const declineTime    = decline.declinedAt ? new Date(decline.declinedAt).getTime() : 0;
+  const declinerIdStr  = decline.staffId ? decline.staffId.toString() : '';
+
+  let replacement  = null;
+  let closestDelta = Infinity;
+
+  for (const member of booking.assignedTeam) {
+    if (member.staffId.toString() === declinerIdStr) continue;
+    // ObjectId first 4 bytes = seconds since Unix epoch
+    const addedAtMs = parseInt(member._id.toString().substring(0, 8), 16) * 1000;
+    const delta     = addedAtMs - declineTime;
+    if (delta > 0 && delta < closestDelta) {
+      closestDelta = delta;
+      replacement  = member;
+    }
+  }
+
+  return replacement
+    ? { staffEmail: replacement.staffEmail, staffName: replacement.staffName }
+    : { staffEmail: booking.assignedStaffEmail || '', staffName: booking.assignedStaffName || '' };
+};
+
 const getReassignmentData = async (req, res) => {
   try {
     const bookingsWithDeclines = await Booking.find({ 'declineHistory.0': { $exists: true } })
@@ -309,12 +342,14 @@ const getReassignmentData = async (req, res) => {
         });
 
         if (wasReassigned) {
+          const replacement = findReplacement(booking, decline);
+
           reassignments.push({
             taskId,
             originalStaff:     decline.staffEmail || '',
             originalStaffName: decline.staffName  || '',
-            newStaff:          booking.assignedStaffEmail || '',
-            newStaffName:      booking.assignedStaffName  || '',
+            newStaff:          replacement.staffEmail,
+            newStaffName:      replacement.staffName,
             reason:            decline.reason || '',
             reassignedAt:      decline.declinedAt,
             reassignedDate:    declinedAt.toLocaleDateString(),
@@ -334,12 +369,12 @@ const getReassignmentData = async (req, res) => {
             type:          'task-reassigned',
             taskId,
             originalStaff: decline.staffName,
-            newStaff:      booking.assignedStaffName,
+            newStaff:      replacement.staffName,
             reason:        decline.reason,
             customer,      service,
             date:          booking.date || '',
             time:          booking.time || '',
-            message:       `Task ${taskId} automatically reassigned from ${decline.staffName} to ${booking.assignedStaffName}`,
+            message:       `Task ${taskId} automatically reassigned from ${decline.staffName} to ${replacement.staffName}`,
             timestamp:     decline.declinedAt,
             notificationDate: declinedAt.toLocaleDateString(),
             notificationTime: declinedAt.toLocaleTimeString(),

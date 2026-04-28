@@ -407,6 +407,20 @@ const declineTask = async (req, res) => {
         m => m.staffId.toString() !== req.user._id.toString()
       );
 
+      // If the declining member was the team lead, reassign lead to next remaining member
+      if (booking.assignedStaffId && booking.assignedStaffId.toString() === req.user._id.toString()) {
+        const remaining = booking.assignedTeam;
+        if (remaining.length > 0) {
+          booking.assignedStaffId    = remaining[0].staffId;
+          booking.assignedStaffName  = remaining[0].staffName;
+          booking.assignedStaffEmail = remaining[0].staffEmail;
+        } else {
+          booking.assignedStaffId    = undefined;
+          booking.assignedStaffName  = undefined;
+          booking.assignedStaffEmail = undefined;
+        }
+      }
+
       // Find replacement — exclude current team and everyone who already declined
       const excludeIds = [
         ...booking.assignedTeam.map(m => m.staffId),

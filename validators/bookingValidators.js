@@ -8,21 +8,21 @@ const TIME_SLOTS = [
 ];
 
 const dateField = z
-  .string({ required_error: 'date is required' })
+  .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be in YYYY-MM-DD format')
   .refine(val => !isNaN(Date.parse(val)), 'date must be a valid calendar date');
 
 const timeField = z
-  .string({ required_error: 'time is required' })
+  .string()
   .refine(val => TIME_SLOTS.includes(val), `time must be one of: ${TIME_SLOTS.join(', ')}`);
 
 // POST /api/bookings
 const createBookingSchema = z.object({
   date:            dateField,
   time:            timeField,
-  address:         z.string({ required_error: 'address is required' }).min(5, 'address must be at least 5 characters'),
-  price:           z.number({ required_error: 'price is required' }).positive('price must be greater than 0'),
-  paymentMethod:   z.string({ required_error: 'paymentMethod is required' }).min(1, 'paymentMethod is required'),
+  address:         z.string().min(5, 'address must be at least 5 characters'),
+  price:           z.number().positive('price must be greater than 0'),
+  paymentMethod:   z.string().min(1, 'paymentMethod is required'),
   serviceName:     z.string().min(1).optional(),
   serviceCategory: z.string().min(1).optional(),
 }).refine(
@@ -38,7 +38,7 @@ const rescheduleSchema = z.object({
 
 // PATCH /api/bookings/:id/decline
 const declineSchema = z.object({
-  reason: z.string({ required_error: 'reason is required' }).min(3, 'reason must be at least 3 characters'),
+  reason: z.string().min(3, 'reason must be at least 3 characters'),
 });
 
 // GET /api/bookings/slot-check?date=
