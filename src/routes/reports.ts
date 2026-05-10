@@ -26,7 +26,14 @@ router.get('/bookings', authenticate, requireRole(...MANAGER_ROLES), async (req:
       .sort({ date: -1 })
       .select('bookingId customerName serviceName serviceCategory date time status price paidAmount balanceAmount paymentMethod paymentStatus assignedStaffName');
 
-    res.json(bookings);
+    const summary = {
+  total:     bookings.length,
+  completed: bookings.filter(b => b.status === 'completed').length,
+  cancelled: bookings.filter(b => b.status === 'cancelled').length,
+  pending:   bookings.filter(b => ['pending','confirmed-unpaid'].includes(b.status)).length,
+  revenue:   bookings.filter(b => b.paymentStatus === 'paid').reduce((s, b) => s + b.paidAmount, 0),
+};
+res.json({ bookings, summary });
   } catch (err) {
     console.error('GET /reports/bookings error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -89,7 +96,15 @@ router.get('/staff-performance', authenticate, requireRole(...MANAGER_ROLES), as
       status: s.status,
     }));
 
-    res.json(report);
+    const summary = {
+  totalStaff:  report.length,
+  activeStaff: report.filter(r => r.status === 'Active').length,
+  totalJobs:   report.reduce((s, r) => s + r.jobsCompleted, 0),
+  avgRating:   report.length > 0
+    ? (report.reduce((s, r) => s + r.rating, 0) / report.length).toFixed(2)
+    : '0.00',
+};
+res.json({ staff: report, summary });
   } catch (err) {
     console.error('GET /reports/staff-performance error:', err);
     res.status(500).json({ error: 'Server error' });
