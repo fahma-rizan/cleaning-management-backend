@@ -30,6 +30,7 @@ const getRequiredSpecialization = (booking) => {
 };
 
 // Pick `count` least-loaded staff from candidates (checks both single and team bookings)
+//leastloaded
 const pickLeastLoaded = async (candidates, count = 1) => {
   const withLoad = await Promise.all(candidates.map(async staff => {
     const load = await Booking.countDocuments({
@@ -41,7 +42,7 @@ const pickLeastLoaded = async (candidates, count = 1) => {
     });
     return { staff, load };
   }));
-  withLoad.sort((a, b) => a.load - b.load);
+  withLoad.sort((a, b) => a.load - b.load);  // ascending = least loaded first
   return withLoad.slice(0, count).map(x => x.staff);
 };
 
@@ -94,6 +95,7 @@ const autoAssignBooking = async (booking) => {
         return;
       }
 
+      //teambooking
       const chosen = await pickLeastLoaded(candidates, 3);
       booking.assignedTeam = chosen.map(s => ({
         staffId:    s._id,
@@ -116,6 +118,7 @@ const autoAssignBooking = async (booking) => {
         return;
       }
 
+      //singlestaffbooking
       const chosen = await pickLeastLoaded(candidates, 1);
       booking.assignedStaffId    = chosen[0]._id;
       booking.assignedStaffName  = chosen[0].name;
@@ -245,7 +248,7 @@ const checkSlotAvailability = async (req, res) => {
   }
 };
 
-// ─── PATCH /api/bookings/:id/reschedule ──────────────────────────────────────
+// reschedulefunction─── PATCH /api/bookings/:id/reschedule ──────────────────────────
 const rescheduleBooking = async (req, res) => {
   try {
     const { date, time } = req.body;
@@ -255,6 +258,7 @@ const rescheduleBooking = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Cannot reschedule a cancelled or completed booking.' });
     }
 
+    // Check the new slot is not already full (max 3 bookings per slot)
     const count = await Booking.countDocuments({
       date, time,
       status: { $nin: ['cancelled'] },
@@ -263,7 +267,8 @@ const rescheduleBooking = async (req, res) => {
     if (count >= 3) {
       return res.status(400).json({ success: false, message: 'That time slot is fully booked. Please choose a different time.' });
     }
-
+    
+    //update date and time
     booking.date = date;
     booking.time = time;
 
@@ -290,7 +295,7 @@ const rescheduleBooking = async (req, res) => {
   }
 };
 
-// ─── PATCH /api/bookings/:id/cancel ──────────────────────────────────────────
+// cancelBookingfunction─── PATCH /api/bookings/:id/cancel ────────────────────────────
 const cancelBooking = async (req, res) => {
   try {
     const booking = await Booking.findOne({ _id: req.params.id, customerId: req.user._id });
@@ -432,7 +437,8 @@ const declineTask = async (req, res) => {
         _id:  { $nin: excludeIds },
         ...availFilter,
       });
-
+      
+      //replacementSinglestaffbooking — find a different staff member
       if (candidates.length > 0) {
         const chosen = await pickLeastLoaded(candidates, 1);
         booking.assignedTeam.push({
@@ -447,7 +453,7 @@ const declineTask = async (req, res) => {
         booking.adminNotificationReason = `Team member ${req.user.name} declined. No replacement available.`;
       }
     } else {
-      // Single-staff booking — find a different staff member
+      //replacementSinglestaffbooking — find a different staff member
       const candidates = await User.find({
         role: { $in: ['staff', 'cleaner'] },
         _id:  { $ne: req.user._id },
