@@ -23,11 +23,13 @@ export interface IBooking extends Document {
   assignedStaffName:  string;
   assignedStaffEmail: string;
   assignedTeam:       { staffId: mongoose.Types.ObjectId; staffName: string; staffEmail: string }[];
+  scheduledAt?:       Date;
   createdAt:          Date;
   updatedAt:          Date;
 }
 
 const BookingSchema = new Schema<IBooking>({
+  scheduledAt:        { type: Date, default: null },
   bookingId:          { type: String, required: true, unique: true },
   customerId:         { type: Schema.Types.ObjectId, ref: 'Customer', required: true },
   customerName:       { type: String, required: true },

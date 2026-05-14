@@ -13,6 +13,7 @@ import reviewRoutes       from './routes/reviews';
 import complaintRoutes    from './routes/complaints';
 import overviewRoutes     from './routes/overview';
 import reportsRoutes      from './routes/reports';
+import settingsRoutes from './routes/settings';
 
 const app = express();
 
@@ -27,6 +28,7 @@ app.use('/api/reviews',    reviewRoutes);
 app.use('/api/complaints', complaintRoutes);
 app.use('/api/overview', overviewRoutes);
 app.use('/api/reports', reportsRoutes);
+app.use('/api/settings', settingsRoutes);
 
 app.get('/', (req, res) => res.json({ message: 'CloudLaundry API running' }));
 

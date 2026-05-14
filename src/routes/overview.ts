@@ -63,20 +63,40 @@ router.get('/revenue-chart', authenticate, requireRole(...ALL), async (req: Auth
 // GET /api/overview/service-breakdown
 router.get('/service-breakdown', authenticate, requireRole(...ALL), async (req: AuthRequest, res: Response) => {
   try {
-    const result = await Booking.aggregate([
-      { $group: { _id: '$serviceCategory', value: { $sum: 1 } } },
-      { $sort:  { value: -1 } },
-      { $limit: 5 },
-    ]);
+    const categories = [
+      { name: 'Home/Office Cleaning',     dbValue: 'home',    color: '#7C3AED' },
+      { name: 'Laundry Cleaning',         dbValue: 'laundry', color: '#3B82F6' },
+      { name: 'Shampoo Vacuum Cleaning',  dbValue: 'shampoo', color: '#F59E0B' },
+      { name: 'Curtains Cleaning',        dbValue: 'curtain', color: '#D946EF' },
+    ];
 
-    const colors = ['#7C3AED', '#3B82F6', '#F59E0B', '#D946EF', '#64748B'];
-    const data   = result.map((r, i) => ({
-      name:  r._id || 'Other',
-      value: r.value,
-      color: colors[i] || '#64748B',
-    }));
+    const data = await Promise.all(
+      categories.map(async (cat) => {
+        // Get all service names in this category from pricelists
+        const PriceList = (await import('../models/PriceList')).default;
+        const services  = await PriceList.find({ category: cat.dbValue }).select('serviceName');
+        const names     = services.map(s => s.serviceName);
 
-    res.json(data);
+        // Count bookings that match any service in this category
+        const count = await Booking.countDocuments({
+          $or: [
+            { serviceCategory: { $in: names } },
+            { serviceName:     { $in: names } },
+            { serviceType:     { $regex: cat.dbValue, $options: 'i' } },
+          ]
+        });
+
+        return { name: cat.name, value: count, color: cat.color };
+      })
+    );
+
+    // If no real bookings yet, show equal distribution so chart renders
+    const total = data.reduce((sum, d) => sum + d.value, 0);
+    const result = total === 0
+      ? data.map(d => ({ ...d, value: 1 }))
+      : data;
+
+    res.json(result);
   } catch (err) {
     console.error('GET /overview/service-breakdown error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -86,11 +106,15 @@ router.get('/service-breakdown', authenticate, requireRole(...ALL), async (req: 
 // GET /api/overview/recent-bookings
 router.get('/recent-bookings', authenticate, requireRole(...ALL), async (req: AuthRequest, res: Response) => {
   try {
-    const bookings = await Booking.find()
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .select('bookingId customerName serviceName serviceCategory date time status price paidAmount paymentStatus');
+    const showAll = req.query.all === 'true';
 
+    const query = Booking.find()
+      .sort({ scheduledAt: -1, date: -1, createdAt: -1 })
+      .select('bookingId customerName serviceName serviceCategory date time status price paidAmount paymentStatus scheduledAt');
+
+    if (!showAll) query.limit(5);
+
+    const bookings = await query;
     res.json(bookings);
   } catch (err) {
     console.error('GET /overview/recent-bookings error:', err);
