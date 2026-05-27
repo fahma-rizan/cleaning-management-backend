@@ -170,6 +170,32 @@ Cloud Laundry.lk Support Team
 📞 +94 11 234 5678
     `.trim(),
   },
+
+  'payment-failed': {
+    subject: '⚠️ Payment Failed — Please Try Again — Cloud Laundry.lk',
+    body: (v) => `
+Dear ${v.customer_name},
+
+Unfortunately, your recent payment attempt failed.
+
+DETAILS
+───────────────────────────────
+Booking ID     : ${v.booking_id}
+Amount         : Rs. ${v.amount}
+Reason         : ${v.failure_reason || 'Payment was declined by the provider.'}
+───────────────────────────────
+
+Please try the payment again. You can use the link below to retry:
+👉 ${v.retry_link}
+
+If you continue to have issues, please contact our support team at +94 11 234 5678.
+
+We apologize for the inconvenience.
+
+Best regards,
+Cloud Laundry.lk Team
+    `.trim(),
+  },
 };
 
 // ── @route  POST /api/email/send ──────────────────────────────────────────
@@ -247,6 +273,33 @@ router.post('/payment-link', async (req, res) => {
     res.status(500).json({ message: 'Failed to send payment link', error: error.message });
   }
 });
+
+// ── @route  GET /api/email/templates ──────────────────────────────────────────
+// Get a list of all available email templates and their required variables
+router.get('/templates', (req, res) => {
+  try {
+    const templateList = Object.keys(TEMPLATES).map(id => {
+      const template = TEMPLATES[id];
+      const bodyString = template.body.toString();
+      
+      // Extract variable names from the template body function (e.g., v.customer_name -> customer_name)
+      const variables = [...bodyString.matchAll(/v\.(\w+)/g)].map(match => match[1]);
+      const uniqueVariables = [...new Set(variables)]; // Remove duplicates
+
+      return {
+        id,
+        subject: typeof template.subject === 'function' ? template.subject({}) : template.subject,
+        variables: uniqueVariables,
+      };
+    });
+    res.status(200).json(templateList);
+  } catch (error) {
+    console.error('Error fetching templates:', error.message);
+    res.status(500).json({ message: 'Failed to fetch templates', error: error.message });
+  }
+});
+
+module.exports = router;
 
 // ── @route  POST /api/email/balance-reminder ──────────────────────────────
 // Send balance payment reminder (advance+balance flow)

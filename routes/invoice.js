@@ -3,17 +3,8 @@ const router = express.Router();
 const crypto = require('crypto');
 const Invoice = require('../models/Invoice');
 const Counter = require('../models/Counter');
+const { determineInvoiceDetails, generateInvoiceNumber } = require('../utils/invoiceUtils');
 const { sendPaymentConfirmationEmail } = require('../utils/emailService');
-
-// Helper function to get next sequence value for invoice numbers
-async function getNextSequenceValue(sequenceName) {
-  const counter = await Counter.findOneAndUpdate(
-    { name: sequenceName },
-    { $inc: { value: 1 } },
-    { new: true, upsert: true }
-  );
-  return counter.value;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IMPORTANT: Literal/specific routes MUST be defined BEFORE dynamic /:param
@@ -203,28 +194,57 @@ router.get('/user/:userId', async (req, res) => {
 // @desc    Create a new invoice (used by customer payment flow and staff)
 router.post('/', async (req, res) => {
   try {
-    const sequenceNumber = await getNextSequenceValue('invoiceNumber');
-    const dateStr = new Date().toISOString().split('T')[0].replace(/-/g, '');
+    // Destructure all expected fields from the request body, trusting frontend calculations
+    const {
+      invoiceType,
+      status,
+      customer,
+      bookingId,
+      serviceItems,
+      customizationItems,
+      discounts,
+      subTotal,
+      taxAmount,
+      totalAmount,
+      paidAmount,
+      balanceAmount,
+      notes
+    } = req.body;
 
-    const servicePrefixes = {
-      'Home Cleaning':                   'HC',
-      'Curtain Cleaning':                'CC',
-      'Laundry Cleaning':                'LC',
-      'Sofa/Mattress Interior Cleaning': 'SM',
-    };
-
-    const firstServiceItemName = req.body.serviceItems?.[0]?.name || '';
-    const serviceCode = servicePrefixes[firstServiceItemName] || 'GEN';
-    const invoiceNumber = `INV-${serviceCode}-${dateStr}-${sequenceNumber.toString().padStart(4, '0')}`;
-
-    const newInvoice = new Invoice({
-      ...req.body,
-      invoiceNumber,
-    });
-
-    if (!newInvoice.totalAmount) {
-      return res.status(400).json({ msg: 'Request body is missing required invoice fields.' });
+    // Basic validation to ensure core objects are present
+    if (!customer || !serviceItems || !bookingId || totalAmount === undefined) {
+      return res.status(400).json({ msg: 'Missing required fields: customer, serviceItems, bookingId, or totalAmount.' });
     }
+
+    // --- Server-Side Controlled Fields ---
+    // Use unified utility for category tagging and invoice number generation
+    const { prefix, categories } = determineInvoiceDetails(serviceItems);
+    const invoiceNumber = await generateInvoiceNumber(prefix);
+
+    // Create the invoice object using data from the frontend
+    const newInvoice = new Invoice({
+      invoiceNumber, // Generated on server
+      mainCategories: categories, // Added for inclusive filtering
+      invoiceType,
+      status,
+      customer,
+      bookingId,
+      serviceItems,
+      customizationItems,
+      discounts,
+      subTotal,
+      taxAmount,
+      totalAmount,
+      paidAmount,
+      balanceAmount,
+      notes,
+      // Generate the payment history event on the server if applicable
+      history: (status === 'PAID' || status === 'PARTIAL') && paidAmount > 0 ? [{
+        event: 'Payment Received',
+        details: `Payment of Rs. ${paidAmount.toFixed(2)} recorded during creation.`,
+        timestamp: new Date()
+      }] : []
+    });
 
     const invoice = await newInvoice.save();
 
@@ -237,9 +257,17 @@ router.post('/', async (req, res) => {
 
     res.status(201).json(invoice);
   } catch (error) {
-    console.error('Error creating invoice:', error.message);
+    // Enhanced error logging for detailed debugging
+    console.error('--- INVOICE CREATION FAILED ---');
+    console.error('Full Error Object:', JSON.stringify(error, null, 2));
+    console.error('-------------------------------');
+
     if (error.code === 11000) {
       return res.status(400).json({ msg: 'An invoice with this number already exists.' });
+    }
+    // Provide more detailed validation error messages
+    if (error.name === 'ValidationError') {
+        return res.status(400).json({ msg: 'Validation Error', errors: error.errors });
     }
     res.status(500).send('Server Error');
   }
@@ -419,7 +447,7 @@ router.post('/:id/pay-balance', async (req, res) => {
     invoice.balanceAmount = 0;
     invoice.status = 'PAID';
 
-    // Add payment history
+    // Add to invoice history
     invoice.history.push({
       event: 'Balance Payment Received',
       timestamp: new Date(),
@@ -446,7 +474,7 @@ router.post('/:id/pay-balance', async (req, res) => {
 // @desc    Generate financial reports
 router.get('/reports/financial', async (req, res) => {
   try {
-    const { startDate, endDate, status, paymentMethod } = req.query;
+    const { startDate, endDate, status, paymentMethod, category } = req.query;
 
     const filters = {};
 
@@ -460,6 +488,11 @@ router.get('/reports/financial', async (req, res) => {
     // Status filter
     if (status) {
       filters.status = status;
+    }
+
+    // Inclusive Category filter
+    if (category) {
+      filters.mainCategories = category; // MongoDB matches if category exists in the array
     }
 
     // Fetch invoices

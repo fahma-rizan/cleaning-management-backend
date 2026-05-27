@@ -6,7 +6,7 @@ const path      = require('path');
 const http      = require('http');
 const { Server }= require('socket.io');
 
-dotenv.config({ path: path.resolve(__dirname, '../.env') });
+dotenv.config();
 
 const connectDB = async () => {
   try {
@@ -28,7 +28,7 @@ const app  = express();
 const httpServer = http.createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: ["http://localhost:3000", "http://localhost:3001"], // Allow both frontend ports
+    origin: ["http://localhost:3000", "http://localhost:3001", "http://localhost:3006"], // Allow all possible frontend ports
     methods: ["GET", "POST"]
   }
 });
@@ -50,6 +50,7 @@ const emailRoutes         = require('./routes/email');            // NEW — Nod
 const bookingRoutes       = require('./routes/booking');
 const analyticsRoutes     = require('./routes/analytics');        // NEW — Analytics
 const paymentReminderRoutes = require('./routes/paymentReminders'); // NEW — Payment Reminders
+const payhereRoutes = require('./routes/payhere');
 const errorHandler = require('./middleware/errorHandler');
 
 app.use('/api/notifications',    notificationRoutes);
@@ -60,17 +61,21 @@ app.use('/api/email',            emailRoutes);           // NEW — Nodemailer
 app.use('/api/bookings',         bookingRoutes);
 app.use('/api/analytics',        analyticsRoutes);       // NEW — Analytics
 app.use('/api/payment-reminders', paymentReminderRoutes); // NEW — Payment Reminders
+app.use('/api/payhere', payhereRoutes);
 app.use(errorHandler); // --- Centralized Error Handling ---
 
 // --- Socket.IO Connection ---
 // Authentication middleware for Socket.IO
 io.use((socket, next) => {
   // In production, verify JWT from socket.handshake.auth.token
-  // For now, allow all connections with optional userId
-  const userId = socket.handshake.auth?.userId;
+  // For now, allow all connections with optional userId and userRole
+  const { userId, userRole } = socket.handshake.auth || {};
   if (userId) {
     socket.userId = userId;
     console.log(`[Socket.IO] User ${userId} connecting as socket ${socket.id}`);
+  }
+  if (userRole) {
+    socket.userRole = userRole;
   }
   next();
 });
@@ -82,6 +87,12 @@ io.on('connection', (socket) => {
   if (socket.userId) {
     socket.join(`user:${socket.userId}`);
     console.log(`[Socket.IO] User ${socket.userId} joined personal room`);
+  }
+
+  // If the user is an admin, join the admin-room
+  if (socket.userRole === 'admin') {
+    socket.join('admin-room');
+    console.log(`[Socket.IO] Admin user ${socket.id} joined admin-room`);
   }
 
   // Handle payment status updates

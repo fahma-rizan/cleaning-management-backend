@@ -15,10 +15,13 @@ const bookingSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
-  serviceType: {
-    type: String,
-    required: true,
-  },
+  serviceItems: [
+    {
+      name: { type: String, required: true },
+      price: { type: Number, required: true },
+      // Add other service-specific fields here if needed in the future
+    },
+  ],
   price: {
     type: Number,
     required: true,
@@ -37,8 +40,25 @@ const bookingSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['PENDING', 'CONFIRMED', 'CANCELLED', 'COMPLETED'],
+    enum: ['PENDING', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'ADVANCE_PAID'],
     default: 'PENDING',
+  },
+  advanceAmount: {
+    type: Number,
+    default: 0,
+  },
+  balanceAmount: {
+    type: Number,
+    default: 0,
+  },
+  paymentMethod: {
+    type: String,
+    enum: ['ONLINE', 'CASH', 'NOT_PAID'],
+    default: 'NOT_PAID',
+  },
+  balancePaid: {
+    type: Boolean,
+    default: false,
   },
   createdAt: {
     type: Date,

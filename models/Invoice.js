@@ -46,7 +46,13 @@ const invoiceSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
-  serviceItems: [invoiceItemSchema],
+  serviceItems: [
+    {
+      name: { type: String, required: true },
+      price: { type: Number, required: true },
+      quantity: { type: Number, default: 1 },
+    },
+  ],
   customizationItems: [invoiceItemSchema],
   discounts: [discountSchema],
   taxAmount: {
@@ -72,10 +78,17 @@ const invoiceSchema = new mongoose.Schema({
   qrCodeUrl: {
     type: String,
   },
+  payherePaymentId: {
+    type: String,
+  },
   notes: {
     type: String,
   },
-  // FIX (Bug 9): history array is now part of the schema so events persist to MongoDB
+  // FIX (Invoicing Logic): Added mainCategories to store LND, CUR, SVC, HOC tags for filtering
+  mainCategories: [{
+    type: String,
+    enum: ['LND', 'CUR', 'SVC', 'HOC'],
+  }],
   history: [historySchema],
 }, { timestamps: true });
 
