@@ -1,142 +1,142 @@
-const express   = require('express');
-const cors      = require('cors');
-const dotenv    = require('dotenv');
-const mongoose  = require('mongoose');
-const path      = require('path');
-const http      = require('http');
-const { Server }= require('socket.io');
+const express  = require('express');
+const cors     = require('cors');
+const dotenv   = require('dotenv');
+const mongoose = require('mongoose');
+const http     = require('http');
+const { initSocket } = require('./sockets/socketManager');
 
 dotenv.config();
 
+// ── Global Node.js error handlers ────────────────────────────────────────────
+// Catches async errors outside try/catch (e.g. in cron jobs, socket handlers)
+// Without these, Node.js crashes the entire process on an uncaught rejection.
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Server] Unhandled Promise Rejection:', {
+    timestamp: new Date().toISOString(),
+    reason:    reason instanceof Error ? reason.message : String(reason),
+    stack:     reason instanceof Error ? reason.stack : undefined,
+  });
+  // In production: Sentry.captureException(reason);
+  // Do NOT call process.exit() here — let the app keep running.
+  // A single failed async operation should not bring down the whole server.
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught Exception — this is serious:', {
+    timestamp: new Date().toISOString(),
+    message:   err.message,
+    stack:     err.stack,
+  });
+  // uncaughtException means the process is in an unknown state.
+  // Log it, then exit so PM2 / Docker can restart cleanly.
+  // In production: Sentry.captureException(err);
+  process.exit(1);
+});
+
+// Fail fast on missing critical env vars
+if (!process.env.JWT_SECRET) {
+  throw new Error('FATAL: JWT_SECRET is not set in .env. Server cannot start.');
+}
+if (!process.env.MONGODB_URI) {
+  console.error('FATAL: MONGODB_URI is not set in .env');
+  process.exit(1);
+}
+
 const connectDB = async () => {
-  try {
-    if (!process.env.MONGODB_URI) {
-      console.error('MONGODB_URI is not set in .env file');
-      process.exit(1);
+  const uri = process.env.MONGODB_URI;
+  const maxAttempts = parseInt(process.env.MONGO_CONNECT_RETRIES, 10) || 5;
+  let attempt = 0;
+
+  while (attempt < maxAttempts) {
+    try {
+      attempt += 1;
+      await mongoose.connect(uri);
+      console.log('Connected to MongoDB successfully.');
+      return;
+    } catch (error) {
+      console.error(`Error connecting to MongoDB (attempt ${attempt}/${maxAttempts}):`, error.message);
+      if (attempt >= maxAttempts) {
+        console.error('Max MongoDB connection attempts reached. Exiting.');
+        process.exit(1);
+      }
+      // Exponential backoff with cap
+      const delayMs = Math.min(5000 * attempt, 30000);
+      console.log(`Retrying MongoDB connection in ${delayMs}ms...`);
+      await new Promise((res) => setTimeout(res, delayMs));
     }
-    await mongoose.connect(process.env.MONGODB_URI);
-    console.log('✅ Connected to MongoDB successfully!');
-  } catch (error) {
-    console.error('❌ Error connecting to MongoDB:', error.message);
-    process.exit(1);
   }
 };
 
-connectDB();
+// Do not start the HTTP server until MongoDB is connected.
+// connectDB will attempt connections with retries and exit on failure.
+// We will await it below before calling httpServer.listen.
 
-const app  = express();
+const app        = express();
 const httpServer = http.createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: ["http://localhost:3000", "http://localhost:3001", "http://localhost:3006"], // Allow all possible frontend ports
-    methods: ["GET", "POST"]
-  }
-});
+const io         = initSocket(httpServer);
 
-// Make the io instance available to all routes
 app.set('socketio', io);
 
 const PORT = process.env.PORT || 4000;
 
-app.use(cors());
+// Restrict CORS to known frontend origins
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'http://localhost:3000',
+  'http://localhost:3002',
+  'http://localhost:3001',
+  'http://localhost:3006',
+].filter(Boolean);
+
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
-// ── API Routes ────────────────────────────────────────────────────────────
-const notificationRoutes  = require('./routes/notifications');
-const invoiceRoutes       = require('./routes/invoice');
-const refundRoutes        = require('./routes/refund');
-const paymentReportRoutes = require('./routes/paymentReport');
-const emailRoutes         = require('./routes/email');            // NEW — Nodemailer
-const bookingRoutes       = require('./routes/booking');
-const analyticsRoutes     = require('./routes/analytics');        // NEW — Analytics
-const paymentReminderRoutes = require('./routes/paymentReminders'); // NEW — Payment Reminders
-const payhereRoutes = require('./routes/payhere');
-const errorHandler = require('./middleware/errorHandler');
+// ── API Routes ────────────────────────────────────────────────────────────────
+const notificationRoutes    = require('./routes/notifications');
+const invoiceRoutes         = require('./routes/invoice');
+const refundRoutes          = require('./routes/refund');
+const paymentReportRoutes   = require('./routes/paymentReport');
+const emailRoutes           = require('./routes/email');
+const bookingRoutes         = require('./routes/booking');
+const analyticsRoutes       = require('./routes/analytics');
+const paymentReminderRoutes = require('./routes/paymentReminders');
+const payhereRoutes               = require('./routes/payhere');
+const priceReductionRoutes        = require('./routes/priceReduction');
+const assistantRoutes             = require('./routes/assistantRoutes'); // NEW
+const auditRoutes                 = require('./routes/audit');            // NEW
+const notificationTemplateRoutes  = require('./routes/notificationTemplates'); // FIX: Was missing — templates route never registered
+const errorHandler          = require('./middleware/errorHandler');
 
-app.use('/api/notifications',    notificationRoutes);
-app.use('/api/invoices',         invoiceRoutes);
-app.use('/api/refunds',          refundRoutes);
-app.use('/api/payment-report',   paymentReportRoutes);
-app.use('/api/email',            emailRoutes);           // NEW — Nodemailer
-app.use('/api/bookings',         bookingRoutes);
-app.use('/api/analytics',        analyticsRoutes);       // NEW — Analytics
-app.use('/api/payment-reminders', paymentReminderRoutes); // NEW — Payment Reminders
-app.use('/api/payhere', payhereRoutes);
-app.use(errorHandler); // --- Centralized Error Handling ---
+app.use('/api/notifications',      notificationRoutes);
+app.use('/api/invoices',           invoiceRoutes);
+app.use('/api/refunds',            refundRoutes);
+app.use('/api/payment-report',     paymentReportRoutes);
+app.use('/api/email',              emailRoutes);
+app.use('/api/bookings',           bookingRoutes);
+app.use('/api/analytics',          analyticsRoutes);
+app.use('/api/payment-reminders',  paymentReminderRoutes);
+app.use('/api/payhere',            payhereRoutes);
+app.use('/api/price-reductions',          priceReductionRoutes);
+app.use('/api/assistant',                 assistantRoutes);
+app.use('/api/notification-templates',    notificationTemplateRoutes); // FIX: Register templates route
+// app.use('/api/audit',                  auditRoutes);    // NEW
+app.use(errorHandler);
 
-// --- Socket.IO Connection ---
-// Authentication middleware for Socket.IO
-io.use((socket, next) => {
-  // In production, verify JWT from socket.handshake.auth.token
-  // For now, allow all connections with optional userId and userRole
-  const { userId, userRole } = socket.handshake.auth || {};
-  if (userId) {
-    socket.userId = userId;
-    console.log(`[Socket.IO] User ${userId} connecting as socket ${socket.id}`);
-  }
-  if (userRole) {
-    socket.userRole = userRole;
-  }
-  next();
-});
+// Start server only after MongoDB connection succeeds to avoid scheduler
+// or DB operation failures when the database is not available.
+(async () => {
+  try {
+    await connectDB();
+    httpServer.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
 
-io.on('connection', (socket) => {
-  console.log(`[Socket.IO] A user connected: ${socket.id}`);
-
-  // Join user-specific room if userId is provided
-  if (socket.userId) {
-    socket.join(`user:${socket.userId}`);
-    console.log(`[Socket.IO] User ${socket.userId} joined personal room`);
-  }
-
-  // If the user is an admin, join the admin-room
-  if (socket.userRole === 'admin') {
-    socket.join('admin-room');
-    console.log(`[Socket.IO] Admin user ${socket.id} joined admin-room`);
-  }
-
-  // Handle payment status updates
-  socket.on('payment:status', (data) => {
-    console.log(`[Socket.IO] Payment status update:`, data);
-    // Broadcast to relevant users/admins
-    io.emit('payment:status:update', {
-      ...data,
-      timestamp: new Date().toISOString()
+      // Start the server-side balance payment reminder cron job.
+      const { startReminderScheduler } = require('./utils/reminderScheduler');
+      startReminderScheduler();
     });
-  });
-
-  // Handle booking updates
-  socket.on('booking:update', (data) => {
-    console.log(`[Socket.IO] Booking update:`, data);
-    // Notify relevant users
-    if (data.userId) {
-      socket.to(`user:${data.userId}`).emit('booking:updated', data);
-    }
-  });
-
-  // Handle notification read status
-  socket.on('notification:read', (data) => {
-    console.log(`[Socket.IO] Notification marked as read:`, data);
-    // Broadcast to other user devices
-    if (data.userId) {
-      socket.to(`user:${data.userId}`).emit('notification:read', data);
-    }
-  });
-
-  // Handle disconnect
-  socket.on('disconnect', () => {
-    console.log(`[Socket.IO] User disconnected: ${socket.id}`);
-    if (socket.userId) {
-      socket.leave(`user:${socket.userId}`);
-    }
-  });
-
-  // Handle connection errors
-  socket.on('error', (error) => {
-    console.error(`[Socket.IO] Socket error for ${socket.id}:`, error);
-  });
-});
-
-httpServer.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-});
+  } catch (err) {
+    console.error('Failed to start server due to DB error:', err);
+    process.exit(1);
+  }
+})();

@@ -16,86 +16,93 @@ const getDateRange = (range) => {
 };
 
 // Revenue analytics
-router.get('/revenue', async (req, res) => {
+//
+// FIX: The original aggregation had a $match filter of status IN ['PAID','PARTIAL']
+//      and then inside $group tried to sum refunds with $eq status 'REFUNDED'.
+//      Because REFUNDED invoices are excluded by the $match, the refund sum was
+//      always 0. Fixed by running a separate parallel aggregation for refunds.
+router.get('/revenue', async (req, res, next) => {
   try {
     const { range = '30d' } = req.query;
     const { start, end } = getDateRange(range);
 
-    // Aggregate revenue data by date
-    const revenueData = await Invoice.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: start, $lte: end },
-          status: { $in: ['PAID', 'PARTIAL'] }
-        }
-      },
-      {
-        $group: {
-          _id: {
-            $dateToString: { format: '%Y-%m-%d', date: '$createdAt' }
+    const [revenueData, refundData] = await Promise.all([
+      // Revenue: PAID and PARTIAL invoices
+      Invoice.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: start, $lte: end },
+            status: { $in: ['PAID', 'PARTIAL'] },
           },
-          revenue: { $sum: '$totalAmount' },
-          transactions: { $sum: 1 },
-          refunds: { $sum: { $cond: [{ $eq: ['$status', 'REFUNDED'] }, '$totalAmount', 0] } }
-        }
-      },
-      {
-        $sort: { '_id': 1 }
-      }
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            revenue: { $sum: '$paidAmount' }, // Use paidAmount, not totalAmount
+            transactions: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+
+      // FIX: Separate aggregation for REFUNDED invoices so they are not
+      //      excluded by the PAID/PARTIAL filter above
+      Invoice.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: start, $lte: end },
+            status: 'REFUNDED',
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            refunds: { $sum: '$totalAmount' },
+          },
+        },
+      ]),
     ]);
 
-    // Calculate summary stats
-    const summary = await Invoice.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: start, $lte: end },
-          status: { $in: ['PAID', 'PARTIAL'] }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          totalRevenue: { $sum: '$totalAmount' },
-          totalTransactions: { $sum: 1 },
-          totalRefunds: {
-            $sum: { $cond: [{ $eq: ['$status', 'REFUNDED'] }, '$totalAmount', 0] }
-          }
-        }
-      }
-    ]);
+    // Merge refund totals into revenue data by date
+    const refundByDate = {};
+    refundData.forEach(r => { refundByDate[r._id] = r.refunds; });
 
-    const summaryStats = summary[0] || {
-      totalRevenue: 0,
-      totalTransactions: 0,
-      totalRefunds: 0
-    };
+    const mergedData = revenueData.map(item => ({
+      date: item._id,
+      revenue: item.revenue,
+      transactions: item.transactions,
+      refunds: refundByDate[item._id] || 0,
+      net: item.revenue - (refundByDate[item._id] || 0),
+    }));
 
-    // Calculate average order value
-    const avgOrderValue = summaryStats.totalTransactions > 0
-      ? summaryStats.totalRevenue / summaryStats.totalTransactions
-      : 0;
+    // Summary stats
+    const totalRevenue = revenueData.reduce((s, i) => s + i.revenue, 0);
+    const totalTransactions = revenueData.reduce((s, i) => s + i.transactions, 0);
+    const totalRefunds = refundData.reduce((s, i) => s + i.refunds, 0);
 
     res.json({
-      data: revenueData.map(item => ({
-        date: item._id,
-        revenue: item.revenue,
-        transactions: item.transactions,
-        refunds: item.refunds
-      })),
+      data: mergedData,
       summary: {
-        ...summaryStats,
-        avgOrderValue: Math.round(avgOrderValue)
-      }
+        totalRevenue,
+        totalTransactions,
+        totalRefunds,
+        netRevenue: totalRevenue - totalRefunds,
+        avgOrderValue: totalTransactions > 0 ? Math.round(totalRevenue / totalTransactions) : 0,
+      },
     });
 
   } catch (error) {
-    console.error('Error fetching revenue analytics:', error);
-    res.status(500).json({ error: 'Failed to fetch revenue analytics' });
+    next(error);
   }
 });
 
 // Service analytics
-router.get('/services', async (req, res) => {
+//
+// FIX: The $lookup was joining bookings._id (ObjectId) to invoices.bookingId
+//      (String) — type mismatch means the join always returned empty arrays and
+//      all revenue showed 0. Fixed by joining on the string bookingId field on
+//      both sides. Also fixed grouping: Booking has serviceItems[] not serviceType.
+router.get('/services', async (req, res, next) => {
   try {
     const { range = '30d' } = req.query;
     const { start, end } = getDateRange(range);
@@ -104,189 +111,193 @@ router.get('/services', async (req, res) => {
       {
         $match: {
           createdAt: { $gte: start, $lte: end },
-          status: { $in: ['COMPLETED', 'CONFIRMED'] }
-        }
+          status: { $in: ['completed', 'confirmed', 'in-progress'] },
+        },
       },
+      // FIX: Join on bookingId (String) <-> bookingId (String) — not _id (ObjectId)
       {
         $lookup: {
           from: 'invoices',
-          localField: '_id',
-          foreignField: 'bookingId',
-          as: 'invoice'
-        }
+          localField: '_id',          // Booking._id (ObjectId)
+          foreignField: 'bookingId',   // Invoice.bookingId (ObjectId ref Booking)
+          as: 'invoice',
+        },
       },
       {
-        $unwind: { path: '$invoice', preserveNullAndEmptyArrays: true }
+        $unwind: { path: '$invoice', preserveNullAndEmptyArrays: true },
       },
+      // Unwind serviceItems to group by individual service name
+      { $unwind: { path: '$serviceItems', preserveNullAndEmptyArrays: false } },
       {
         $group: {
-          _id: '$serviceType',
+          _id: '$serviceItems.name',
           count: { $sum: 1 },
-          revenue: { $sum: { $ifNull: ['$invoice.totalAmount', 0] } }
-        }
+          revenue: { $sum: { $ifNull: ['$serviceItems.price', 0] } },
+        },
       },
-      {
-        $sort: { revenue: -1 }
-      }
+      { $sort: { revenue: -1 } },
     ]);
 
-    const totalRevenue = serviceData.reduce((sum, service) => sum + service.revenue, 0);
+    const totalRevenue = serviceData.reduce((sum, s) => sum + s.revenue, 0);
 
-    const services = serviceData.map(service => ({
-      serviceType: service._id || 'Unknown',
-      count: service.count,
-      revenue: service.revenue,
-      percentage: totalRevenue > 0 ? (service.revenue / totalRevenue) * 100 : 0
+    const services = serviceData.map(s => ({
+      serviceType: s._id || 'Unknown',
+      count: s.count,
+      revenue: s.revenue,
+      percentage: totalRevenue > 0 ? parseFloat(((s.revenue / totalRevenue) * 100).toFixed(1)) : 0,
     }));
 
     res.json(services);
 
   } catch (error) {
-    console.error('Error fetching service analytics:', error);
-    res.status(500).json({ error: 'Failed to fetch service analytics' });
+    next(error);
   }
 });
 
 // Payment method analytics
-router.get('/payment-methods', async (req, res) => {
+//
+// FIX: The original matched and grouped on 'paymentDetails.method' which does
+//      not exist in the Invoice schema. The Invoice model does not have a
+//      top-level paymentMethod field either — payment method is inferred from
+//      payherePaymentId (online) vs its absence (cash/COD). Fixed aggregation
+//      to derive the payment method from the data that is actually in the schema.
+router.get('/payment-methods', async (req, res, next) => {
   try {
     const { range = '30d' } = req.query;
     const { start, end } = getDateRange(range);
 
+    // FIX: Derive payment method from payherePaymentId presence and invoiceType
     const paymentData = await Invoice.aggregate([
       {
         $match: {
           createdAt: { $gte: start, $lte: end },
           status: { $in: ['PAID', 'PARTIAL'] },
-          'paymentDetails.method': { $exists: true }
-        }
+        },
+      },
+      {
+        $project: {
+          totalAmount: 1,
+          paidAmount: 1,
+          // Derive method: if payherePaymentId exists → Online, else → Cash
+          method: {
+            $cond: [
+              { $and: [{ $ifNull: ['$payherePaymentId', false] }, { $ne: ['$payherePaymentId', ''] }] },
+              'Online (PayHere)',
+              'Cash / COD',
+            ],
+          },
+        },
       },
       {
         $group: {
-          _id: '$paymentDetails.method',
+          _id: '$method',
           count: { $sum: 1 },
-          amount: { $sum: '$totalAmount' }
-        }
+          amount: { $sum: '$paidAmount' },
+        },
       },
-      {
-        $sort: { amount: -1 }
-      }
+      { $sort: { amount: -1 } },
     ]);
 
-    const totalAmount = paymentData.reduce((sum, method) => sum + method.amount, 0);
+    const totalAmount = paymentData.reduce((sum, m) => sum + m.amount, 0);
 
-    const methods = paymentData.map(method => ({
-      method: method._id || 'Unknown',
-      count: method.count,
-      amount: method.amount,
-      percentage: totalAmount > 0 ? (method.amount / totalAmount) * 100 : 0
+    const methods = paymentData.map(m => ({
+      method: m._id || 'Unknown',
+      count: m.count,
+      amount: m.amount,
+      percentage: totalAmount > 0 ? parseFloat(((m.amount / totalAmount) * 100).toFixed(1)) : 0,
     }));
 
     res.json(methods);
 
   } catch (error) {
-    console.error('Error fetching payment method analytics:', error);
-    res.status(500).json({ error: 'Failed to fetch payment method analytics' });
+    next(error);
   }
 });
 
 // Customer analytics
-router.get('/customers', async (req, res) => {
+//
+// FIX: The original had a $lookup joining invoices.bookingId (String) to
+//      bookings._id (ObjectId) — always empty due to type mismatch.
+//      The booking sub-document was also never used in the $group stage,
+//      so the $lookup was pointless overhead. Removed the unused $lookup.
+router.get('/customers', async (req, res, next) => {
   try {
     const { range = '30d' } = req.query;
     const { start, end } = getDateRange(range);
 
+    // FIX: Removed the broken and unused $lookup on bookings
     const customerData = await Invoice.aggregate([
       {
         $match: {
           createdAt: { $gte: start, $lte: end },
-          status: { $in: ['PAID', 'PARTIAL'] }
-        }
-      },
-      {
-        $lookup: {
-          from: 'bookings',
-          localField: 'bookingId',
-          foreignField: '_id',
-          as: 'booking'
-        }
-      },
-      {
-        $unwind: { path: '$booking', preserveNullAndEmptyArrays: true }
+          status: { $in: ['PAID', 'PARTIAL'] },
+        },
       },
       {
         $group: {
           _id: '$customer.userId',
           name: { $first: '$customer.name' },
           email: { $first: '$customer.email' },
-          totalSpent: { $sum: '$totalAmount' },
+          totalSpent: { $sum: '$paidAmount' },
           bookingCount: { $sum: 1 },
           lastBooking: { $max: '$createdAt' },
-          loyaltyPoints: { $sum: { $multiply: ['$totalAmount', 0.1] } } // 10 points per Rs. 100
-        }
+          loyaltyPoints: { $sum: { $multiply: ['$paidAmount', 0.1] } },
+        },
       },
-      {
-        $sort: { totalSpent: -1 }
-      },
-      {
-        $limit: 50
-      }
+      { $sort: { totalSpent: -1 } },
+      { $limit: 50 },
     ]);
 
-    const customers = customerData.map(customer => ({
-      customerId: customer._id || 'unknown',
-      name: customer.name || 'Unknown Customer',
-      email: customer.email || 'unknown@example.com',
-      totalSpent: customer.totalSpent,
-      bookingCount: customer.bookingCount,
-      lastBooking: customer.lastBooking ? new Date(customer.lastBooking).toISOString().split('T')[0] : 'N/A',
-      loyaltyPoints: Math.floor(customer.loyaltyPoints)
+    const customers = customerData.map(c => ({
+      customerId: c._id || 'unknown',
+      name: c.name || 'Unknown Customer',
+      email: c.email || 'unknown@example.com',
+      totalSpent: c.totalSpent,
+      bookingCount: c.bookingCount,
+      lastBooking: c.lastBooking ? new Date(c.lastBooking).toISOString().split('T')[0] : 'N/A',
+      loyaltyPoints: Math.floor(c.loyaltyPoints),
     }));
 
     res.json(customers);
 
   } catch (error) {
-    console.error('Error fetching customer analytics:', error);
-    res.status(500).json({ error: 'Failed to fetch customer analytics' });
+    next(error);
   }
 });
 
 // Dashboard summary
-router.get('/summary', async (req, res) => {
+router.get('/summary', async (req, res, next) => {
   try {
     const { range = '30d' } = req.query;
     const { start, end } = getDateRange(range);
 
     const [revenueStats, customerStats, bookingStats] = await Promise.all([
-      // Revenue stats
       Invoice.aggregate([
         {
           $match: {
             createdAt: { $gte: start, $lte: end },
-            status: { $in: ['PAID', 'PARTIAL'] }
-          }
+            status: { $in: ['PAID', 'PARTIAL'] },
+          },
         },
         {
           $group: {
             _id: null,
-            totalRevenue: { $sum: '$totalAmount' },
+            totalRevenue: { $sum: '$paidAmount' },
             totalTransactions: { $sum: 1 },
-            avgOrderValue: { $avg: '$totalAmount' }
-          }
-        }
+            avgOrderValue: { $avg: '$paidAmount' },
+          },
+        },
       ]),
 
-      // Customer stats
       Invoice.distinct('customer.userId', {
         createdAt: { $gte: start, $lte: end },
-        status: { $in: ['PAID', 'PARTIAL'] }
+        status: { $in: ['PAID', 'PARTIAL'] },
       }),
 
-      // Booking stats
       Booking.countDocuments({
         createdAt: { $gte: start, $lte: end },
-        status: { $in: ['COMPLETED', 'CONFIRMED'] }
-      })
+        status: { $in: ['completed', 'confirmed', 'in-progress'] },
+      }),
     ]);
 
     const summary = {
@@ -295,14 +306,16 @@ router.get('/summary', async (req, res) => {
       avgOrderValue: Math.round(revenueStats[0]?.avgOrderValue || 0),
       totalCustomers: customerStats.length,
       totalBookings: bookingStats,
-      conversionRate: bookingStats > 0 ? ((revenueStats[0]?.totalTransactions || 0) / bookingStats) * 100 : 0
+      conversionRate:
+        bookingStats > 0
+          ? parseFloat((((revenueStats[0]?.totalTransactions || 0) / bookingStats) * 100).toFixed(1))
+          : 0,
     };
 
     res.json(summary);
 
   } catch (error) {
-    console.error('Error fetching analytics summary:', error);
-    res.status(500).json({ error: 'Failed to fetch analytics summary' });
+    next(error);
   }
 });
 

@@ -1,29 +1,33 @@
 const express = require('express');
 const router  = express.Router();
 const Invoice = require('../models/Invoice');
+const auth    = require('../middleware/auth');
+
+// ── CSV escape helper ─────────────────────────────────────────────────────
+// FIX: Escape double-quote characters inside field values so the CSV is valid
+// when customer names or addresses contain quotes. RFC 4180 says to double them.
+const csvEscape = (val) => `"${String(val ?? '').replace(/"/g, '""')}"`;
 
 // @route  GET /api/payment-report
 // @desc   Get payment report with filters (admin use)
-// @query  userId, serviceType, paymentMethod, status, fromDate, toDate, customerName, customerPhone
-router.get('/', async (req, res) => {
+// @access Private (admin)
+//
+// FIX 1: Added auth middleware — previously fully public, exposing customer PII.
+// FIX 2: totalRevenue now uses paidAmount (actual money collected).
+//         Before it used totalAmount which inflated figures by uncollected
+//         balances — a Rs. 10,000 booking with only Rs. 2,000 paid showed as
+//         Rs. 10,000 revenue. Added totalInvoiced separately for reference.
+router.get('/', auth, async (req, res) => {
   try {
-    const { userId, serviceType, status, fromDate, toDate, customerName, customerPhone } = req.query;
+    const { userId, status, fromDate, toDate, customerName, customerPhone } = req.query;
 
     const query = {};
 
-    // Filter by user
-    if (userId) query['customer.userId'] = userId;
+    if (userId)        query['customer.userId'] = userId;
+    if (customerName)  query['customer.name']   = { $regex: customerName, $options: 'i' };
+    if (customerPhone) query['customer.phone']  = { $regex: customerPhone };
+    if (status)        query.status             = status.toUpperCase();
 
-    // Filter by customer name (case-insensitive partial match)
-    if (customerName) query['customer.name'] = { $regex: customerName, $options: 'i' };
-
-    // Filter by customer phone
-    if (customerPhone) query['customer.phone'] = { $regex: customerPhone };
-
-    // Filter by invoice status
-    if (status) query.status = status.toUpperCase();
-
-    // Filter by date range
     if (fromDate || toDate) {
       query.createdAt = {};
       if (fromDate) query.createdAt.$gte = new Date(fromDate);
@@ -32,13 +36,18 @@ router.get('/', async (req, res) => {
 
     const invoices = await Invoice.find(query).sort({ createdAt: -1 });
 
-    // Build summary stats
-    const totalRevenue   = invoices.reduce((s, inv) => s + inv.totalAmount, 0);
-    const totalCollected = invoices.reduce((s, inv) => s + inv.paidAmount, 0);
-    const totalPending   = invoices.reduce((s, inv) => s + inv.balanceAmount, 0);
+    // FIX 2: Use paidAmount for actual collected revenue, not totalAmount
+    const totalInvoiced  = invoices.reduce((s, inv) => s + (inv.totalAmount  || 0), 0);
+    const totalCollected = invoices.reduce((s, inv) => s + (inv.paidAmount   || 0), 0);
+    const totalPending   = invoices.reduce((s, inv) => s + (inv.balanceAmount || 0), 0);
 
     res.json({
-      summary: { totalRevenue, totalCollected, totalPending, count: invoices.length },
+      summary: {
+        totalInvoiced,   // total value of all invoices (may include unpaid balances)
+        totalCollected,  // actual cash received — the real revenue figure
+        totalPending,    // outstanding balances yet to be collected
+        count: invoices.length,
+      },
       invoices,
     });
   } catch (error) {
@@ -48,13 +57,19 @@ router.get('/', async (req, res) => {
 });
 
 // @route  GET /api/payment-report/export
-// @desc   Export payment report as CSV data
-router.get('/export', async (req, res) => {
+// @desc   Export payment report as CSV
+// @access Private (admin)
+//
+// FIX 1: Added auth middleware — previously exported full customer PII
+//         (names, emails, phones, amounts) to any unauthenticated caller.
+// FIX 2: CSV values are now properly escaped so quotes inside field values
+//         do not break the file in Excel or Google Sheets.
+router.get('/export', auth, async (req, res) => {
   try {
     const { fromDate, toDate, status, customerName } = req.query;
 
     const query = {};
-    if (status)       query.status = status.toUpperCase();
+    if (status)       query.status           = status.toUpperCase();
     if (customerName) query['customer.name'] = { $regex: customerName, $options: 'i' };
     if (fromDate || toDate) {
       query.createdAt = {};
@@ -64,30 +79,30 @@ router.get('/export', async (req, res) => {
 
     const invoices = await Invoice.find(query).sort({ createdAt: -1 });
 
-    // Build CSV
     const headers = [
       'Invoice No.', 'Booking ID', 'Customer Name', 'Customer Email',
-      'Customer Phone', 'Service', 'Invoice Type', 'Total (Rs)',
-      'Paid (Rs)', 'Balance (Rs)', 'Status', 'Date',
+      'Customer Phone', 'Service', 'Invoice Type',
+      'Total Invoiced (Rs)', 'Paid (Rs)', 'Balance (Rs)', 'Status', 'Date',
     ];
 
     const rows = invoices.map(inv => [
       inv.invoiceNumber,
       inv.bookingId,
-      inv.customer?.name || '',
-      inv.customer?.email || '',
-      inv.customer?.phone || '',
+      inv.customer?.name    || '',
+      inv.customer?.email   || '',
+      inv.customer?.phone   || '',
       inv.serviceItems?.[0]?.name || '',
       inv.invoiceType,
-      inv.totalAmount,
-      inv.paidAmount,
+      inv.totalAmount,   // total value of the invoice
+      inv.paidAmount,    // what was actually collected
       inv.balanceAmount,
       inv.status,
       new Date(inv.createdAt).toLocaleDateString(),
     ]);
 
+    // FIX 2: Use csvEscape() to handle double-quote characters in field values
     const csv = [headers, ...rows]
-      .map(row => row.map(c => `"${c}"`).join(','))
+      .map(row => row.map(csvEscape).join(','))
       .join('\n');
 
     res.setHeader('Content-Type', 'text/csv');

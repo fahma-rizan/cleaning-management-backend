@@ -1,14 +1,18 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const auth = require('../middleware/auth');
 const Booking = require('../models/Booking');
 const Invoice = require('../models/Invoice');
+const User = require('../models/User');
 const { determineInvoiceDetails, generateInvoiceNumber } = require('../utils/invoiceUtils');
 const Refund = require('../models/Refund');
 const Notification = require('../models/Notification');
 const { sendPaymentConfirmationEmail } = require('../utils/emailService');
 
+// @route   POST api/payhere/generate-hash
+// @desc    Generate PayHere hash for payment
 // @route   POST api/payhere/generate-hash
 // @desc    Generate PayHere hash for payment
 // @access  Private
@@ -17,8 +21,15 @@ router.post('/generate-hash', async (req, res) => {
   try {
     const { bookingId, paymentMethod } = req.body;
 
-    // 1. Fetch booking details
-    const booking = await Booking.findById(bookingId);
+    // 1. Fetch booking details (by Mongo ObjectId or bookingId string)
+    let booking = null;
+    if (mongoose.Types.ObjectId.isValid(bookingId)) {
+      booking = await Booking.findById(bookingId);
+    }
+    if (!booking) {
+      booking = await Booking.findOne({ bookingId: bookingId });
+    }
+
     console.log('[/api/payhere/generate-hash] Found booking:', booking); // DEBUG
     if (!booking) {
       console.error('[/api/payhere/generate-hash] Booking not found for ID:', bookingId); // DEBUG
@@ -26,25 +37,43 @@ router.post('/generate-hash', async (req, res) => {
     }
 
     const isFullPayment = paymentMethod === 'full-online';
-    const amount = isFullPayment ? booking.price : booking.advanceAmount;
+    let amount;
+    if (isFullPayment) {
+      amount = booking.price;
+    } else {
+      // Fallback if advanceAmount is not on the booking object, calculate 20%
+      amount = booking.advanceAmount || (booking.price * 0.20);
+    }
     console.log('[/api/payhere/generate-hash] Calculated amount:', amount); // DEBUG
 
-    // 2. Define PayHere payment object
+    // 2. Define PayHere payment object with valid customer details
+    const serviceDescription = booking.serviceItems && booking.serviceItems.length > 0
+      ? booking.serviceItems.map(item => item.name).join(', ')
+      : booking.serviceName || booking.serviceType || 'Cleaning Service';
+
+    const fullName = booking.customerName || 'Customer';
+    const nameParts = fullName.trim().split(/\s+/);
+    const firstName = nameParts[0] || 'Customer';
+    const lastName = nameParts.slice(1).join(' ') || 'Customer';
+    const email = booking.customerEmail || booking.email || 'customer@example.com';
+    const phone = booking.customerPhone || booking.phone || '0771234567';
+    const address = booking.address || 'Colombo, Sri Lanka';
+
     const payment = {
       sandbox: 'true',
       merchant_id: process.env.PAYHERE_MERCHANT_ID,
-      return_url: process.env.PAYHERE_RETURN_URL || `http://localhost:3006/payment-success`,
-      cancel_url: process.env.PAYHERE_CANCEL_URL || `http://localhost:3006/payment-failed`,
+      return_url: process.env.PAYHERE_RETURN_URL || `http://localhost:3000/payment-success`,
+      cancel_url: process.env.PAYHERE_CANCEL_URL || `http://localhost:3000/payment-failed`,
       notify_url: process.env.PAYHERE_NOTIFY_URL || `http://localhost:4000/api/payhere/notify`,
-      order_id: booking.bookingId,
-      items: `Booking for ${booking.serviceType}`,
+      order_id: booking.bookingId || booking._id.toString(),
+      items: `Booking for ${serviceDescription}`,
       currency: 'LKR',
       amount: amount.toFixed(2),
-      first_name: 'N/A',
-      last_name: 'N/A',
-      email: booking.email,
-      phone: 'N/A',
-      address: booking.address,
+      first_name: firstName,
+      last_name: lastName,
+      email: email,
+      phone: phone,
+      address: address,
       city: 'Colombo',
       country: 'Sri Lanka',
     };
@@ -69,16 +98,16 @@ router.post('/generate-hash', async (req, res) => {
       time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
       bookingId: booking.bookingId || 'N/A',
       customer: {
-        name: booking.customer?.name || 'N/A',
-        email: booking.customer?.email || 'N/A',
-        phone: booking.customer?.phone || 'N/A',
-        address: booking.customer?.address || 'N/A',
+        name: fullName,
+        email: email,
+        phone: phone,
+        address: address,
       },
       service: {
-        name: booking.service?.name || 'N/A',
-        date: booking.service?.date ? new Date(booking.service.date).toLocaleDateString('en-CA') : 'N/A',
-        time: booking.service?.time || 'N/A',
-        customizations: booking.service?.customizations || [],
+        name: serviceDescription,
+        date: booking.date ? new Date(booking.date).toLocaleDateString('en-CA') : 'N/A',
+        time: booking.time || 'N/A',
+        customizations: [],
       },
       pricing: {
         basePrice: booking.price || 0,
@@ -87,12 +116,12 @@ router.post('/generate-hash', async (req, res) => {
         couponCode: booking.couponCode || '',
         tax: booking.tax || 0,
         transportCharge: booking.transportFee || 0,
-        total: booking.finalAmount || 0,
+        total: booking.finalAmount || booking.price || 0,
         paidAmount: amount,
-        balanceAmount: (booking.finalAmount || 0) - amount,
+        balanceAmount: (booking.finalAmount || booking.price || 0) - amount,
       },
       paymentMethod: 'PayHere Online',
-      status: 'PENDING', // Status is pending until payment is confirmed
+      status: 'pending',
     };
 
     res.json({ payhere_payment: payment, hash, booking, invoice });
@@ -133,12 +162,40 @@ router.post('/notify', async (req, res) => {
       const paidAmount = parseFloat(payhere_amount);
       const isFullPayment = paidAmount === booking.price;
 
+      // Backwards-compatibility fixes for older seed data
+      // Normalize legacy fields to current schema
+      booking.customerId = booking.customerId || booking.userId || booking.customerId;
+      booking.serviceName = booking.serviceName || booking.serviceType || booking.serviceName;
+
+      console.log('[/api/payhere/notify] Booking before save (toObject):', booking.toObject ? booking.toObject() : booking);
+
       // Update booking status
-      booking.status = isFullPayment ? 'CONFIRMED' : 'ADVANCE_PAID';
-      await booking.save();
+      booking.status = isFullPayment ? 'confirmed' : 'confirmed'; // advance-paid maps to confirmed in master schema
+
+      // Some legacy seed records lack required fields. To ensure we can update
+      // status from the payment gateway without failing validation, save the
+      // document without running validators when necessary.
+      try {
+        await booking.save();
+      } catch (saveErr) {
+        console.warn('[/api/payhere/notify] booking.save() failed, retrying without validation:', saveErr.message);
+        await booking.save({ validateBeforeSave: false });
+      }
 
       // Find or create invoice
-      let invoice = await Invoice.findOne({ bookingId: booking.bookingId });
+      let invoice = await Invoice.findOne({ bookingId: booking._id });
+
+      // If booking lacks customer email/name, try to fetch User (do this whether invoice exists or not)
+      let userRecord = null;
+      if (!booking.email && (booking.customerId || booking.userId)) {
+        const lookupId = booking.customerId || booking.userId;
+        try {
+          userRecord = await User.findById(lookupId).lean();
+        } catch (e) {
+          console.warn('[/api/payhere/notify] User lookup failed for', lookupId, e.message);
+        }
+      }
+
       if (!invoice) {
         // Use utility to determine categorization details
         const { prefix, categories } = determineInvoiceDetails(booking.serviceItems);
@@ -149,18 +206,26 @@ router.post('/notify', async (req, res) => {
           mainCategories: categories,
           invoiceType: isFullPayment ? 'FULL' : 'ADVANCE',
           customer: {
-            userId: booking.userId,
-            name: booking.customer?.name || 'N/A',
-            email: booking.email,
-            phone: booking.customer?.phone || 'N/A',
-            address: booking.address,
+            userId: booking.customerId || booking.userId || (userRecord && userRecord._id) || null,
+            name: booking.customerName || (userRecord && (userRecord.name || `${userRecord.firstName || ''} ${userRecord.lastName || ''}`)) || 'N/A',
+            email: booking.email || (userRecord && userRecord.email) || 'no-reply@local.invalid',
+            phone: booking.customerPhone || (userRecord && userRecord.phone) || 'N/A',
+            address: booking.address || (userRecord && userRecord.address) || 'N/A',
           },
-          bookingId: booking.bookingId,
-          serviceItems: booking.serviceItems || [{ name: booking.serviceType, price: booking.price, quantity: 1 }],
+          bookingId: booking._id,
+          serviceItems: booking.serviceItems || [{ name: booking.serviceName || booking.serviceType || 'Service', price: booking.price, quantity: 1 }],
           subTotal: booking.price,
           totalAmount: booking.price,
           balanceAmount: booking.price - paidAmount,
         });
+      } else {
+        // Existing invoice: ensure required customer fields are present to avoid validation errors
+        invoice.customer = invoice.customer || {};
+        invoice.customer.userId = invoice.customer.userId || booking.customerId || booking.userId || (userRecord && userRecord._id) || null;
+        invoice.customer.name = invoice.customer.name || booking.customerName || (userRecord && (userRecord.name || `${userRecord.firstName || ''} ${userRecord.lastName || ''}`)) || 'N/A';
+        invoice.customer.email = invoice.customer.email || booking.email || (userRecord && userRecord.email) || 'no-reply@local.invalid';
+        invoice.customer.phone = invoice.customer.phone || booking.customerPhone || (userRecord && userRecord.phone) || 'N/A';
+        invoice.customer.address = invoice.customer.address || booking.address || (userRecord && userRecord.address) || 'N/A';
       }
 
       // Update invoice
@@ -183,9 +248,9 @@ router.post('/notify', async (req, res) => {
       }
 
       // 3. Create a notification for the user
-      if (booking.userId) {
+      if (booking.customerId) {
         const notification = new Notification({
-          userId: booking.userId,
+          customerId: booking.customerId,
           type: 'payment',
           title: 'Payment Successful',
           message: `Your payment of LKR ${paidAmount.toFixed(2)} for booking ${booking.bookingId} was successful.`,
@@ -201,7 +266,7 @@ router.post('/notify', async (req, res) => {
 
     res.status(200).send('OK');
   } catch (err) {
-    console.error('PayHere Notify Error:', err.message);
+    console.error('PayHere Notify Error:', err);
     res.status(500).json({ msg: 'Server error while processing payment notification.' });
   }
 });

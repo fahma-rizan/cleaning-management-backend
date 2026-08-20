@@ -1,203 +1,316 @@
 const nodemailer = require('nodemailer');
 
-// Email failure logging utility
+// ── Logging helpers ───────────────────────────────────────────────────────────
 const logEmailFailure = (context, recipient, error, metadata = {}) => {
-  const timestamp = new Date().toISOString();
   const logEntry = {
-    timestamp,
-    context,
-    recipient,
-    error: error.message || String(error),
+    timestamp: new Date().toISOString(),
+    context, recipient,
+    error:     error.message || String(error),
     errorCode: error.code || 'UNKNOWN',
-    ...metadata
+    ...metadata,
   };
-
-  // Log to console with clear formatting
   console.error('='.repeat(60));
   console.error('EMAIL FAILURE LOG');
   console.error('-'.repeat(60));
   console.error(JSON.stringify(logEntry, null, 2));
   console.error('='.repeat(60));
-
-  // In production, you might also want to:
-  // 1. Store in a database for monitoring
-  // 2. Send to an error tracking service (Sentry, etc.)
-  // 3. Alert admins via Slack/other channels
-
   return logEntry;
 };
 
-// Email success logging utility
 const logEmailSuccess = (context, recipient, metadata = {}) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[EMAIL SUCCESS] ${timestamp} - ${context} - Sent to: ${recipient}`, metadata);
+  console.log(`[EMAIL SUCCESS] ${new Date().toISOString()} - ${context} - Sent to: ${recipient}`, metadata);
 };
 
-// --------------------------------------------------------------------------
-// 1. CREATE THE TRANSPORTER
-// --------------------------------------------------------------------------
-// This is the object that will actually send the emails.
-// We configure it to use Gmail and authenticate with the credentials from our .env file.
-//
+// ── Shared transporter (exported so email.js can reuse — no duplicate instance) ──
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.GMAIL_USER, // Your Gmail address from .env
-    pass: process.env.GMAIL_PASS, // Your App Password from .env
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_PASS,
   },
 });
 
-// --------------------------------------------------------------------------
-// 2. VERIFY THE CONNECTION
-// --------------------------------------------------------------------------
-// It's a good practice to verify that the transporter is ready to send emails.
-// This will try to log in to your Gmail account. You'll see the result in the console.
-//
-transporter.verify((error, success) => {
-  if (error) {
-    logEmailFailure('transporter-verify', 'N/A', error, { success: false });
-    console.log('-------------------------------------------------');
-    console.log('HINT: Is GMAIL_USER and GMAIL_PASS set in your .env file?');
-    console.log('For GMAIL_PASS, you must use a Google App Password, not your regular password.');
-    console.log('-------------------------------------------------');
-  } else {
-    console.log('Email transporter is ready to send emails.');
-  }
-});
+// Verify transporter unless in test environment where we don't want external network calls
+if (process.env.NODE_ENV !== 'test') {
+  transporter.verify((error) => {
+    if (error) {
+      logEmailFailure('transporter-verify', 'N/A', error, { success: false });
+      console.log('HINT: Set GMAIL_USER and GMAIL_PASS in .env (use a Google App Password).');
+    } else {
+      console.log('Email transporter ready.');
+    }
+  });
+}
 
-// --------------------------------------------------------------------------
-// 3. CREATE EMAIL SENDING FUNCTIONS
-// --------------------------------------------------------------------------
+// ── Shared HTML wrapper ───────────────────────────────────────────────────────
+// Gives every email a consistent branded look with a header, body, and footer.
+const htmlWrapper = (title, bodyHtml, invoiceUrl = null) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f5f5; }
+    .wrapper { max-width: 600px; margin: 32px auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .header { background: linear-gradient(135deg, #7c3aed, #6d28d9); padding: 28px 32px; color: #fff; }
+    .header h1 { margin: 0; font-size: 22px; font-weight: 700; }
+    .header p { margin: 4px 0 0; font-size: 13px; opacity: 0.85; }
+    .body { padding: 28px 32px; color: #374151; font-size: 15px; line-height: 1.6; }
+    .body h2 { color: #111827; font-size: 18px; margin: 0 0 16px; }
+    .detail-box { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px 20px; margin: 16px 0; }
+    .detail-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f3f4f6; font-size: 14px; }
+    .detail-row:last-child { border-bottom: none; }
+    .detail-label { color: #6b7280; }
+    .detail-value { font-weight: 600; color: #111827; }
+    .cta-btn { display: inline-block; margin: 20px 0 8px; padding: 12px 28px; background: #7c3aed; color: #fff !important; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 15px; }
+    .cta-btn:hover { background: #6d28d9; }
+    .footer { background: #f9fafb; border-top: 1px solid #e5e7eb; padding: 18px 32px; text-align: center; font-size: 12px; color: #9ca3af; }
+    .badge-paid   { color: #065f46; background: #d1fae5; padding: 2px 10px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+    .badge-partial{ color: #92400e; background: #fef3c7; padding: 2px 10px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <div class="header">
+      <h1>Cloud Laundry.lk</h1>
+      <p>Professional Cleaning Services</p>
+    </div>
+    <div class="body">
+      <h2>${title}</h2>
+      ${bodyHtml}
+      ${invoiceUrl ? `<p style="margin-top:20px"><a href="${invoiceUrl}" class="cta-btn">View Invoice</a></p><p style="font-size:13px;color:#6b7280">Or copy this link: <a href="${invoiceUrl}" style="color:#7c3aed">${invoiceUrl}</a></p>` : ''}
+    </div>
+    <div class="footer">
+      Cloud Laundry.lk &bull; Colombo, Sri Lanka &bull; +94 11 234 5678 &bull; info@cloudlaundry.lk<br>
+      This is a system-generated email. Please do not reply directly.
+    </div>
+  </div>
+</body>
+</html>`;
 
-/**
- * Sends a payment confirmation email to the user.
- * @param {object} invoice - The invoice object from the database.
- */
+// ── 1. Payment confirmation ───────────────────────────────────────────────────
+// FIX: Was called with (email, invoice) — 2 args. Signature is now (invoice) only.
+// FIX: Added invoice link so customer can view/download their invoice.
 const sendPaymentConfirmationEmail = async (invoice) => {
   if (!process.env.GMAIL_USER) {
-    console.warn('[EMAIL] Email not configured - skipping payment confirmation');
+    console.warn('[EMAIL] Not configured — skipping payment confirmation');
     return;
   }
 
+  const invoiceUrl = `${process.env.FRONTEND_URL}/invoice/${invoice.bookingId}`;
+  const isPartial  = invoice.status === 'PARTIAL';
+
+  const body = `
+    <p>Hello <strong>${invoice.customer.name}</strong>,</p>
+    <p>We have successfully received your payment. Here is your payment summary:</p>
+    <div class="detail-box">
+      <div class="detail-row"><span class="detail-label">Invoice Number</span><span class="detail-value">${invoice.invoiceNumber}</span></div>
+      <div class="detail-row"><span class="detail-label">Booking ID</span><span class="detail-value">${invoice.bookingId}</span></div>
+      <div class="detail-row"><span class="detail-label">Amount Paid</span><span class="detail-value">Rs. ${invoice.paidAmount.toLocaleString()}</span></div>
+      ${isPartial ? `<div class="detail-row"><span class="detail-label">Balance Due</span><span class="detail-value" style="color:#92400e">Rs. ${invoice.balanceAmount.toLocaleString()}</span></div>` : ''}
+      <div class="detail-row"><span class="detail-label">Status</span><span class="detail-value"><span class="${isPartial ? 'badge-partial' : 'badge-paid'}">${isPartial ? 'ADVANCE PAID' : 'FULLY PAID'}</span></span></div>
+    </div>
+    ${isPartial ? `<p style="color:#92400e;font-size:14px">⚠️ The remaining balance of <strong>Rs. ${invoice.balanceAmount.toLocaleString()}</strong> will be collected after your service is completed.</p>` : ''}
+    <p>You can view and download your full invoice using the button below:</p>`;
+
   const mailOptions = {
-    from: `"Your Company Name" <${process.env.GMAIL_USER}>`,
-    to: invoice.customer.email, // The customer's email address
-    subject: `Payment Confirmation - Invoice #${invoice.invoiceNumber}`,
-    html: `
-      <h1>Thank you for your payment!</h1>
-      <p>Hello ${invoice.customer.name},</p>
-      <p>We have successfully received your payment of <strong>Rs. ${invoice.paidAmount.toLocaleString()}</strong> for invoice #${invoice.invoiceNumber}.</p>
-      <p>You can view your booking details here: <a href="${process.env.FRONTEND_URL}/bookings/${invoice.bookingId}">View Booking</a></p>
-      <p>Thank you for choosing our service!</p>
-    `,
+    from:    `"Cloud Laundry.lk" <${process.env.GMAIL_USER}>`,
+    to:      invoice.customer.email,
+    subject: `Payment Confirmed — Invoice #${invoice.invoiceNumber} — Cloud Laundry.lk`,
+    html:    htmlWrapper('Payment Confirmed!', body, invoiceUrl),
   };
 
   try {
     await transporter.sendMail(mailOptions);
     logEmailSuccess('payment-confirmation', invoice.customer.email, {
-      invoiceNumber: invoice.invoiceNumber,
-      bookingId: invoice.bookingId,
-      amount: invoice.paidAmount
+      invoiceNumber: invoice.invoiceNumber, bookingId: invoice.bookingId, amount: invoice.paidAmount,
     });
   } catch (error) {
     logEmailFailure('payment-confirmation', invoice.customer.email, error, {
-      invoiceNumber: invoice.invoiceNumber,
-      bookingId: invoice.bookingId
+      invoiceNumber: invoice.invoiceNumber, bookingId: invoice.bookingId,
     });
   }
 };
 
-/**
- * Sends an email to the admin when a refund is requested.
- * @param {object} invoice - The invoice object from the database.
- * @param {string} reason - The reason for the refund request.
- */
-const sendRefundRequestEmail = async (invoice, reason) => {
+// ── 2. Manual invoice send (by admin) ────────────────────────────────────────
+// FIX: This function was missing from the original emailService.js entirely,
+// causing the POST /api/invoices/:invoiceNumber/send-email route to crash.
+const sendInvoiceEmail = async (toEmail, invoice) => {
   if (!process.env.GMAIL_USER) {
-    console.warn('[EMAIL] Email not configured - skipping refund request notification');
+    console.warn('[EMAIL] Not configured — skipping invoice email');
     return;
   }
 
+  const invoiceUrl = `${process.env.FRONTEND_URL}/invoice/${invoice.bookingId}`;
+
+  const body = `
+    <p>Hello <strong>${invoice.customer.name}</strong>,</p>
+    <p>Please find your invoice details below. You can view and download the full formatted invoice using the button below.</p>
+    <div class="detail-box">
+      <div class="detail-row"><span class="detail-label">Invoice Number</span><span class="detail-value">${invoice.invoiceNumber}</span></div>
+      <div class="detail-row"><span class="detail-label">Booking ID</span><span class="detail-value">${invoice.bookingId}</span></div>
+      <div class="detail-row"><span class="detail-label">Total</span><span class="detail-value">Rs. ${invoice.totalAmount.toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-label">Paid</span><span class="detail-value">Rs. ${invoice.paidAmount.toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-label">Balance</span><span class="detail-value">Rs. ${invoice.balanceAmount.toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-label">Status</span><span class="detail-value">${invoice.status}</span></div>
+    </div>`;
+
   const mailOptions = {
-    from: `"System Notification" <${process.env.GMAIL_USER}>`,
-    to: process.env.GMAIL_USER, // Send to admin
-    subject: `New Refund Request - Invoice #${invoice.invoiceNumber}`,
-    html: `
-      <h1>New Refund Request</h1>
-      <p>A refund has been requested for invoice <strong>#${invoice.invoiceNumber}</strong>.</p>
-      <ul>
-        <li>Customer: ${invoice.customer.name} (${invoice.customer.email})</li>
-        <li>Amount Paid: Rs. ${invoice.paidAmount.toLocaleString()}</li>
-        <li>Reason: ${reason}</li>
-      </ul>
-      <p>Please review this request in the admin dashboard.</p>
-    `,
+    from:    `"Cloud Laundry.lk" <${process.env.GMAIL_USER}>`,
+    to:      toEmail,
+    subject: `Invoice #${invoice.invoiceNumber} — Cloud Laundry.lk`,
+    html:    htmlWrapper(`Invoice #${invoice.invoiceNumber}`, body, invoiceUrl),
   };
 
   try {
     await transporter.sendMail(mailOptions);
-    logEmailSuccess('refund-request', process.env.GMAIL_USER, {
-      invoiceNumber: invoice.invoiceNumber,
-      reason: reason
-    });
+    logEmailSuccess('invoice-email', toEmail, { invoiceNumber: invoice.invoiceNumber });
   } catch (error) {
-    logEmailFailure('refund-request', process.env.GMAIL_USER, error, {
-      invoiceNumber: invoice.invoiceNumber
-    });
+    logEmailFailure('invoice-email', toEmail, error, { invoiceNumber: invoice.invoiceNumber });
   }
 };
 
-/**
- * Sends an email to the user about the status of their refund.
- * @param {object} invoice - The invoice object from the database.
- * @param {string} status - 'approved' or 'rejected'.
- * @param {string} [rejectionReason] - The reason for rejection (if applicable).
- */
-const sendRefundStatusEmail = async (invoice, status, rejectionReason = '') => {
+// ── 3. Refund request notification (to admin) ─────────────────────────────────
+const sendRefundRequestEmail = async (invoice, reason) => {
   if (!process.env.GMAIL_USER) {
-    console.warn('[EMAIL] Email not configured - skipping refund status email');
+    console.warn('[EMAIL] Not configured — skipping refund request');
     return;
   }
 
-  const subject = status === 'approved' ? 'Your Refund Has Been Approved' : 'Your Refund Request Status';
-  const html = status === 'approved' ? `
-    <h1>Refund Approved</h1>
-    <p>Hello ${invoice.customer.name},</p>
-    <p>Your refund request for invoice <strong>#${invoice.invoiceNumber}</strong> has been approved.</p>
-    <p>The amount of Rs. ${invoice.paidAmount.toLocaleString()} will be processed back to your original payment method within 5-7 business days.</p>
-  ` : `
-    <h1>Refund Request Rejected</h1>
-    <p>Hello ${invoice.customer.name},</p>
-    <p>We're sorry, but your refund request for invoice <strong>#${invoice.invoiceNumber}</strong> has been rejected.</p>
-    <p><strong>Reason:</strong> ${rejectionReason}</p>
-    <p>If you have any questions, please contact our support team.</p>
-  `;
+  const adminEmail = process.env.ADMIN_EMAIL || process.env.GMAIL_USER;
+  const body = `
+    <p>A refund has been requested for the following invoice:</p>
+    <div class="detail-box">
+      <div class="detail-row"><span class="detail-label">Invoice</span><span class="detail-value">${invoice.invoiceNumber}</span></div>
+      <div class="detail-row"><span class="detail-label">Customer</span><span class="detail-value">${invoice.customer.name} (${invoice.customer.email})</span></div>
+      <div class="detail-row"><span class="detail-label">Amount Paid</span><span class="detail-value">Rs. ${invoice.paidAmount.toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-label">Reason</span><span class="detail-value">${reason}</span></div>
+    </div>
+    <p>Please review this request in the admin dashboard.</p>`;
 
   const mailOptions = {
-    from: `"Your Company Name" <${process.env.GMAIL_USER}>`,
-    to: invoice.customer.email,
-    subject: subject,
-    html: html,
+    from:    `"System Notification" <${process.env.GMAIL_USER}>`,
+    to:      adminEmail,
+    subject: `Refund Request — Invoice #${invoice.invoiceNumber}`,
+    html:    htmlWrapper('New Refund Request', body),
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    logEmailSuccess('refund-request', adminEmail, { invoiceNumber: invoice.invoiceNumber, reason });
+  } catch (error) {
+    logEmailFailure('refund-request', adminEmail, error, { invoiceNumber: invoice.invoiceNumber });
+  }
+};
+
+// ── 4. Refund / price reduction status email ──────────────────────────────────
+// FIX: Added refundAmount as 4th param. Previously the email was sent after
+// invoice.paidAmount was already decremented, so it showed Rs. 0 on full refunds.
+const sendRefundStatusEmail = async (invoice, status, rejectionReason = '', refundAmount = null) => {
+  if (!process.env.GMAIL_USER) {
+    console.warn('[EMAIL] Not configured — skipping refund status email');
+    return;
+  }
+
+  const invoiceUrl   = `${process.env.FRONTEND_URL}/invoice/${invoice.bookingId}`;
+  const displayAmount = refundAmount !== null
+    ? refundAmount.toLocaleString()
+    : invoice.paidAmount.toLocaleString();
+
+  const isApproved = status === 'approved';
+  const subject = isApproved
+    ? `Refund Approved — Rs. ${displayAmount} — Cloud Laundry.lk`
+    : `Refund Request Update — Invoice #${invoice.invoiceNumber}`;
+
+  const body = isApproved ? `
+    <p>Hello <strong>${invoice.customer.name}</strong>,</p>
+    <p>Your refund request has been approved.</p>
+    <div class="detail-box">
+      <div class="detail-row"><span class="detail-label">Invoice</span><span class="detail-value">${invoice.invoiceNumber}</span></div>
+      <div class="detail-row"><span class="detail-label">Refund Amount</span><span class="detail-value" style="color:#065f46">Rs. ${displayAmount}</span></div>
+      <div class="detail-row"><span class="detail-label">Timeline</span><span class="detail-value">5–7 business days</span></div>
+    </div>
+    <p>The refund will be credited to your original payment method within 5–7 business days.</p>` : `
+    <p>Hello <strong>${invoice.customer.name}</strong>,</p>
+    <p>We're sorry, but your refund request for invoice <strong>#${invoice.invoiceNumber}</strong> could not be approved.</p>
+    <div class="detail-box">
+      <div class="detail-row"><span class="detail-label">Reason</span><span class="detail-value">${rejectionReason}</span></div>
+    </div>
+    <p>If you have questions, please contact our support team at info@cloudlaundry.lk or +94 11 234 5678.</p>`;
+
+  const mailOptions = {
+    from:    `"Cloud Laundry.lk" <${process.env.GMAIL_USER}>`,
+    to:      invoice.customer.email,
+    subject,
+    html:    htmlWrapper(isApproved ? 'Refund Approved' : 'Refund Request Update', body, isApproved ? invoiceUrl : null),
   };
 
   try {
     await transporter.sendMail(mailOptions);
     logEmailSuccess('refund-status', invoice.customer.email, {
-      invoiceNumber: invoice.invoiceNumber,
-      status: status,
-      rejectionReason: rejectionReason
+      invoiceNumber: invoice.invoiceNumber, status, refundAmount: displayAmount,
     });
   } catch (error) {
     logEmailFailure('refund-status', invoice.customer.email, error, {
-      invoiceNumber: invoice.invoiceNumber,
-      status: status
+      invoiceNumber: invoice.invoiceNumber, status,
     });
   }
 };
 
+// ── 5. Balance payment reminder ───────────────────────────────────────────────
+// Used by the server-side cron scheduler (reminderScheduler.js).
+const sendBalanceReminderEmail = async (invoice, reminderType = 'first') => {
+  if (!process.env.GMAIL_USER) {
+    console.warn('[EMAIL] Not configured — skipping balance reminder');
+    return;
+  }
+
+  const invoiceUrl = `${process.env.FRONTEND_URL}/balance-payment?bookingId=${invoice.bookingId}&balance=${invoice.balanceAmount}`;
+
+  const urgencyLabel = {
+    first:   'Friendly Reminder',
+    second:  'Second Reminder',
+    final:   'Final Reminder',
+    overdue: 'Overdue Notice',
+  }[reminderType] || 'Payment Reminder';
+
+  const urgencyColour = reminderType === 'overdue' ? '#dc2626' : reminderType === 'final' ? '#d97706' : '#7c3aed';
+
+  const body = `
+    <p>Hello <strong>${invoice.customer.name}</strong>,</p>
+    <p>This is a <strong style="color:${urgencyColour}">${urgencyLabel}</strong> for an outstanding balance on your invoice.</p>
+    <div class="detail-box">
+      <div class="detail-row"><span class="detail-label">Invoice</span><span class="detail-value">${invoice.invoiceNumber}</span></div>
+      <div class="detail-row"><span class="detail-label">Booking ID</span><span class="detail-value">${invoice.bookingId}</span></div>
+      <div class="detail-row"><span class="detail-label">Balance Due</span><span class="detail-value" style="color:${urgencyColour}">Rs. ${invoice.balanceAmount.toLocaleString()}</span></div>
+    </div>
+    <p>Please click the button below to complete your payment:</p>`;
+
+  const mailOptions = {
+    from:    `"Cloud Laundry.lk" <${process.env.GMAIL_USER}>`,
+    to:      invoice.customer.email,
+    subject: `${urgencyLabel}: Balance of Rs. ${invoice.balanceAmount.toLocaleString()} Due — Cloud Laundry.lk`,
+    html:    htmlWrapper(`Payment ${urgencyLabel}`, body, invoiceUrl),
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    logEmailSuccess(`balance-reminder-${reminderType}`, invoice.customer.email, {
+      invoiceNumber: invoice.invoiceNumber, balance: invoice.balanceAmount,
+    });
+  } catch (error) {
+    logEmailFailure(`balance-reminder-${reminderType}`, invoice.customer.email, error, {
+      invoiceNumber: invoice.invoiceNumber,
+    });
+  }
+};
 
 module.exports = {
+  transporter,                    // shared — imported by email.js to avoid duplicate instance
   sendPaymentConfirmationEmail,
+  sendInvoiceEmail,
   sendRefundRequestEmail,
   sendRefundStatusEmail,
+  sendBalanceReminderEmail,
 };

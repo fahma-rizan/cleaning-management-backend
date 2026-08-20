@@ -2,15 +2,15 @@ const request = require('supertest');
 const express = require('express');
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
+// Mock the dependencies early so importing routes doesn't initialize real services
+jest.mock('../models/Notification');
+jest.mock('../utils/emailService');
+
 const payhereRoutes = require('../routes/payhere');
 const Booking = require('../models/Booking');
 const Invoice = require('../models/Invoice');
 const Notification = require('../models/Notification');
 const emailService = require('../utils/emailService');
-
-// Mock the dependencies
-jest.mock('../models/Notification');
-jest.mock('../utils/emailService');
 
 const app = express();
 // Add the io object to the app context for the route to use
@@ -51,30 +51,46 @@ describe('POST /api/payhere/notify', () => {
     // 1. Setup: Create a mock booking and a pending invoice
     const booking = await new Booking({
       bookingId: 'BK-12345',
-      userId: 'user-test-id',
+      customerId: new mongoose.Types.ObjectId(),
+      customerName: 'Test User',
+      customerEmail: 'test@example.com',
       customer: { name: 'Test User', email: 'test@example.com' },
+      serviceName: 'Test Service',
       serviceType: 'Test Service',
-      status: 'CONFIRMED',
+      address: '123 Test St',
+      price: 1500,
+      status: 'confirmed',
     }).save();
 
     const invoice = await new Invoice({
-      bookingId: 'BK-12345',
+      bookingId: booking._id,
       invoiceNumber: 'INV-001',
+      invoiceType: 'FULL',
       customer: { name: 'Test User', email: 'test@example.com' },
+      subTotal: 1500,
       totalAmount: 1500,
       paidAmount: 0,
-      status: 'PENDING',
+      balanceAmount: 1500,
+      status: 'DRAFT',
     }).save();
 
-    // 2. Mock the PayHere payload
+    // Set PayHere env vars and compute a valid md5 signature for the payload
+    process.env.PAYHERE_MERCHANT_ID = 'TESTMID';
+    process.env.PAYHERE_MERCHANT_SECRET = 'TESTSECRET';
+    const crypto = require('crypto');
+
     const payherePayload = {
       order_id: 'BK-12345',
       payment_id: 'PAY-98765',
       payhere_amount: '1500.00',
       payhere_currency: 'LKR',
       status_code: 2, // Success
-      // NOTE: md5sig validation is skipped in test environment or mocked
     };
+
+    const hashedSecret = crypto.createHash('md5').update(process.env.PAYHERE_MERCHANT_SECRET).digest('hex').toUpperCase();
+    payherePayload.md5sig = crypto.createHash('md5').update(
+      `${process.env.PAYHERE_MERCHANT_ID}${payherePayload.order_id}${payherePayload.payhere_amount}${payherePayload.payhere_currency}${payherePayload.status_code}${hashedSecret}`
+    ).digest('hex').toUpperCase();
     
     // Mock the implementation of Notification.save
     Notification.prototype.save = jest.fn().mockResolvedValue(true);
@@ -92,7 +108,7 @@ describe('POST /api/payhere/notify', () => {
     expect(response.status).toBe(200);
 
     // Check if the invoice was updated in the database
-    const updatedInvoice = await Invoice.findOne({ bookingId: 'BK-12345' });
+    const updatedInvoice = await Invoice.findOne({ bookingId: booking._id });
     expect(updatedInvoice.status).toBe('PAID');
     expect(updatedInvoice.paidAmount).toBe(1500);
 
